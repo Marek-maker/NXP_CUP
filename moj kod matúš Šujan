@@ -1,0 +1,345 @@
+#include "mbed.h"   //základné funkcie pre mikrokontroler
+#include "MMA8451Q.h"   //akcelerometer, huh? možno raz použijeme
+#include "tfc.h"    //načítanie knižnice na ovládanie auta
+#include "func.h"   //includneme funkcie v func.h
+#include <vector>   //C++ dynamicke pole
+
+#define HS 0                //ID stredoškolského módu
+#define UNI 1               //ID univerzitného módu
+
+#define NUM_TICKERS 16      //Počet možných lnčasovačov
+#define SERVO_TICKER 0      //ID časovača pre servo
+#define STOP_TICKER 1       //ID časovača pre zastavenieo           :333 :*
+
+#define LED_TICKER 2        //ID časovača pre efektíky       :333
+#define SCAN_TICKER 3       //ID časovača pre kameru       :333
+#define MAX_SPEED 0.66f      //Maximálna rýchlosť          // 0.53!!!!!!
+#define SERVO_FREQ 20       //Perióda frekvencie serva          //test 16  //10  //5
+#define SERVO_FREQ_F 50     //Frekvencia serva                  //test 62.5 //100//200
+
+#define LINE_SIZE_LIMIT2 15
+#define zakruty
+
+
+float MAG_D=0.5f;   //0.5f
+float MAG_P=-0.62f;   // -0.62f
+
+DigitalOut gpo(D0);
+DigitalOut led(LED1);
+uint32_t Tickers[NUM_TICKERS];  //Časovače
+
+//Nasledujúci je C++ kód, takže radšej ignor ako sa tomu snažiť pochopiť, proste to funguje
+struct Line {   //C++ definícia čiary
+    uint16_t m_start;   //začiatok čiary
+    uint16_t m_end;     //koniec čiary
+    Line(uint16_t start,uint16_t end):m_start(start),m_end(end) {} //C++ konštruktor čiary ( to je tá pekna syntax typu: Line(start,end) )
+    Line(const Line& ln):m_start(ln.m_start),m_end(ln.m_end) {}   //C++ nutnosti
+    Line& operator=(const Line& ln) {  //C++ nutnosti
+        m_start=ln.m_start;
+        m_end=ln.m_end;
+        return *this;
+    }
+    uint16_t size() const {
+        return m_end-m_start;    //vráti veľkosť čiary
+    }
+    uint16_t center() const {
+        return (m_end+m_start)/2;    //vráti pozíciu stredu čiary
+    }
+};
+
+std::vector<Line> Lines;    //pole s ciarami, automaticky meni velkost
+
+Serial PC(USBTX,USBRX);     //Výstup cez USB
+#define TERMINAL_PRINTF(...)  //   PC.printf
+
+long _time=0;   //Celkový čas behu programu v ms
+
+void TFC_Ticker()   //strážca času
+{
+    _time+=1;
+    for(int i=0; i<NUM_TICKERS; i++) {
+        Tickers[i]++;
+    }
+}
+
+uint16_t MaxLight,MinLight; //Maximálne svetlo, minimálne svetlo obrazu z kamery
+float AvgVal,AvgValInp;               //Priemerná hodnota svetla z kamery
+float ServoOffset=0.0f;    //odchylka serva, keďže 0 nie je stred
+float ServoPos=0.0f;        //pozícia serva
+float ServoMin=-0.9f;       //limit minima serva
+float ServoMax=0.9f;        //limit maxima serva
+float MaxSpeed=1.0f;        //maximálna rýchlosť
+float ServoPosOriginal=0;
+int LinePos=0;              //pozícia čiary naposledy
+int P,I,D;                  //PID regulátor
+int Mode=1;
+    int BlackLineRight;                         //tu som si nastavil nove premenne ku 2 ciaram
+    int BlackLineLeft;
+    int RoadMiddle=0;;
+    int diff = 0;
+    int diff_old = 0;
+    int CompareData = 100;
+    int ImageDataDifference[115];
+
+
+
+uint16_t LineScan[SCAN_SIZE];   //Obraz z kamery
+float Scanned[SCAN_SIZE];       //Spracovaný obraz z kamery
+
+void RenderLines()  //vykreslenie čiary do konzoly
+{
+    char RenderData[SCAN_SIZE+3];
+    RenderData[SCAN_SIZE]='\0';
+    RenderData[SCAN_SIZE+1]='\0';
+    RenderData[SCAN_SIZE+2]=0;
+    for(int i=0; i<SCAN_SIZE; i++) RenderData[i]=' ';
+    for(size_t i=0,j=Lines.size(); i<j; i++) {
+        Line& line=Lines[i];
+        int start = line.m_start - SCAN_BEGIN;
+        int end = line.m_end - SCAN_BEGIN;
+        for(size_t k=start; k<=end && k<SCAN_SIZE; k++) {
+            RenderData[k]='X';
+        }
+    }
+    TERMINAL_PRINTF("%s",RenderData);
+}
+
+int main()
+{
+    TFC_Init();     //ozivenie motorov, serva, kamery
+    PC.baud(115200);//nastavenie výstupného portu na 115200 Baudrate
+    long button0 = 0;   //čas stlačenia horného tlačidla
+    long button1 = 0;   //čas stlačenia dolného tlačidla
+    int ledFx=0;    //efektíky s LED
+    for(int i=0; i<NUM_TICKERS; i++) Tickers[i]=0;  //vynulovanie časovačov
+    Ticker tick;
+    tick.attach_us(&TFC_Ticker,1000);   //nastavenie aby sa každú ms zavolala funkcia TFC_Ticker
+    bool Motor=false,Stop=false;    //stav chodu motora a indikácia zastavenia
+    long Start=0;   //čas spustenia auta
+    int PushButton0=0;  //stav horného tlačidla
+    int PushButton1=0;  //stav dolného tlačidla
+    TFC_SetMotorPWM(0,0);   //pre istotu vypneme motory
+    int W0=0,W1=0;
+    float VServoPos=0;  //fiktivna pozicia serva
+    
+    int LineCounter=0;
+    int MiniLineCounter=0;
+    int PravoVal=26,LavoVal=102,Mid=18,MidCalc=20,MinusBlack=4,PlusBlack=8,MinimalLineLen=3;
+    float Slowness=0.27f,Speed=0.66f;
+    
+    
+    while (true) {  //hlavný cyklus programu, jedná sa o mikrokontroler, takže program musí bežať 100% času (nekonečný cyklus)
+        //float Pot0=TFC_ReadPot(0);  //prečítame horný potenciometer (hodnoty od -1.0f po 1.0f)
+        //float Pot1=TFC_ReadPot(1);  //prečítame dolný potenciometer
+        float Pot0=0.002;
+        float Pot1=-0.62;
+        //float Pot0 = 0.32f; //od jakuba!!!!
+        //float vyrovnanieServa = 0.035f;
+        MaxSpeed=Speed;
+        LineCounter=0;
+        MiniLineCounter=0;
+
+        //Horné tlačítko bolo stlačené                          stlacime A, program caka ked uvolnis
+        if(!PushButton0&&TFC_ReadPushButton(0)) {
+            if(button0 == 0)
+            button0=_time;
+            if(_time - button0>1500)
+            PushButton0=1;
+            else PushButton0=0;
+            //if(!TFC_ReadPushButton(0))
+             //button0=0;
+        }
+        
+        //Dolné tlačítko bolo stlačené                          stlacime B, program caka ked uvolnis
+        if(!PushButton1&&TFC_ReadPushButton(1)) {
+            PushButton1=1;
+            button1=_time;
+        }
+        //A tlačítko bolo uvoľnené
+        if(PushButton0&&!TFC_ReadPushButton(0)) {  
+        //odstlacime A
+            if(!Motor) {    //Ak bol motor stopnuty, teraz sa zapne
+                TFC_HBRIDGE_ENABLE;
+            } else {        //Inak sa zastavi, stlac restart pre lepsie snimanie
+                TFC_SetMotorPWM(0,0);
+                TFC_HBRIDGE_DISABLE;
+            }
+            Motor=!Motor;   //Ak Motor = true, teraz bude false,  inak naopak
+            if(Motor) Start=_time;  //Zaznamenáme si čas štartu
+            PushButton0=0;
+            Stop=false;
+            button0 = 0;
+        }
+        //B tlačítko bolo odstlacene, Modu sa pripocita 1 (to su tie 4 ledky)
+        if(PushButton1&&!TFC_ReadPushButton(1)) {
+            PushButton1=0;
+            Mode++;
+        }
+        if(Mode >= 5)
+        Mode = 1;
+
+        //Pekné efektíky s LEDkami
+        if(Tickers[LED_TICKER]>=250) {
+            Tickers[LED_TICKER]=0;
+            ledFx++;
+            TFC_SetBatteryLED_Level(Mode);          //(1+Mode%2)
+        }
+
+
+        //Spracovanie obrazu potom ako ho kamera úspešne nasnímala
+        if(TFC_LineScanImageReady>0) {
+            Lines.clear();  //vymažeme predošlé čiary                                            //??
+            TFC_LineScanImageReady=0;   //nastavíme, že sme úspešne spracovali obraz
+            int ScanMinLight=TFC_LineScanImage0[0];
+            int MinPos=0;
+
+
+            for(int i=0; i<SCAN_SIZE; i++) {
+                LineScan[i]=TFC_LineScanImage0[i]; //prekopírujeme obraz z kamery do nášho poľa               
+            } 
+            filterCam(LineScan,Scanned);    //vyfiltrujeme obraz z kamery
+
+            
+            
+            int LineBegin=0;    //začiatok čiary v skene
+            int BigLines=0;     //počet veľkých čiar
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////           
+        //Mode switcher
+        switch(Mode){//PrVal < je mensia zakruta//
+case 1:{PravoVal=10; LavoVal=100; Mid=20; MidCalc=18; Slowness=0.12f; Speed=0.5f; MinusBlack=8; PlusBlack=8; MinimalLineLen=4;break;}      //s66
+case 2:{PravoVal=10; LavoVal=95; Mid=20; MidCalc=18; Slowness=0.12f; Speed=0.5f; MinusBlack=8; PlusBlack=8; MinimalLineLen=4;break;}
+case 3:{PravoVal=10; LavoVal=90; Mid=20; MidCalc=18; Slowness=0.12f; Speed=0.5f; MinusBlack=8; PlusBlack=8; MinimalLineLen=4;break;}
+case 4:{PravoVal=10; LavoVal=80; Mid=20; MidCalc=18; Slowness=0.12f; Speed=0.5f; MinusBlack=5; PlusBlack=5; MinimalLineLen=4;break;}
+default:{led = 0;wait(10);break;}           //svieti ledka -> restartuj            
+            }
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define CONTAINER Scanned 
+
+                    for(int i=55;i<114;i++)                         // calculate difference between the pixels
+    {
+        ImageDataDifference[i] = abs (LineScan[i] - LineScan[i+1]);
+    }
+    CompareData = 100;                    // threshold
+    BlackLineRight = 113;                   // z nejakeho dovodu je celkove pole kamery 114 - 113 je uplne napravo
+    for(int i=55;i<113;i++)                 //program asi pozera tie najtmavsie body od stredu ciary po pravy konec - hlada pravu ciaru
+    {
+        if (ImageDataDifference[i] > CompareData)
+        {
+            CompareData = ImageDataDifference[i];
+            BlackLineRight = i;
+        }
+    }
+    
+    for(int i=54;i>1;i--)                           // calculate difference between the pixels
+    {
+        ImageDataDifference[i] = abs (LineScan[i] - LineScan[i-1]);
+    }
+    CompareData = 100;
+    BlackLineLeft = 1;
+    for(int i=54;i>1;i--)                           //program pozera tie najtmavsie body od stredu ciary po lavy konec - hlada lavu ciaru
+    {
+        if (ImageDataDifference[i] > CompareData)
+        {
+            CompareData = ImageDataDifference[i];
+            BlackLineLeft = i;
+        }
+    }
+    RoadMiddle = (BlackLineLeft + BlackLineRight)/2;             //nevim ci to funguje ale tvarme sa ze ano
+    // ked je ciara len na pravo tak o kolko viac zaboci dolava
+    if (BlackLineRight > 105)                                       //toto znamena ze od akeho bodu bude zabacat do lava
+    {
+        RoadMiddle = BlackLineLeft + PravoVal;                      //o kolko viacej zaboci. Vecsie cislo = agresivnejsie zabacanie
+    }
+    //ked je  ciara len na lavo tak o kolko viac zaboci doprava
+    if (BlackLineLeft <10 )                                         //toto znamena ze od akeho bodu bude zabacat do prava
+    {
+        RoadMiddle = BlackLineRight - LavoVal;                      //o kolko viacej zaboci. Vecsie cislo = agresivnejsie zabacanie
+    }
+    // Ked nevidi ani jednu ciaru
+    if ((BlackLineRight > 105) && (BlackLineLeft < 10))
+    {
+        RoadMiddle = Mid;                                          //ked nevidi obidve ciary ide proste rovno
+    }
+
+    // Uchova stare cisla
+    diff_old = diff;                            
+
+    // Find difference from real middle
+    diff = RoadMiddle - MidCalc;                    // calculate actual difference - ked sa meni tak sa meni agresivita seriev                                            //40 -OUMAAA - 46 -58 - 64 - 
+    
+        if (abs (diff - diff_old) > 50)
+            {
+        diff = diff_old;
+            }
+            
+    // Direction Control Loop: PD Controller
+    VServoPos = MAG_P * diff + MAG_D *diff-diff_old;
+    VServoPos = VServoPos/100;                                  // Vypocet VServoPos pred tymto dava velke cislo tak ho musime zmensit na desatinne miesta a ked ani to nepomoze tak nasledujuce riadky to spravia
+    if(VServoPos >= 0.41f)VServoPos=0.41f;                        //+-0.41 je limit serva tak aby sme ho nenicili a aby sa nedrelo o ram auta
+    if(VServoPos <= -0.41f)VServoPos=-0.41f;
+    
+ //  if(VServoPos >= 0.35f || VServoPos <= -0.35f)               //ak vieme ze budeme zatacat tak nepocitajme ciary, bude lepsi reflex
+   // goto skok;
+    
+//Pocitadlo ciar
+/*if(CompareData < 101)               //ak sme nenasli ziaden cierny bod tak nepocitajme ciary
+    goto skok;*/
+/*for(int i=10; i < 109; i++){
+    MiniLineCounter=0;
+    if(LineScan[i] > 100){
+        for(int j=0;j < 5; j++){
+        if(LineScan[i+j] >= 100)
+            MiniLineCounter++;
+            if(MiniLineCounter >=4){
+                LineCounter++; 
+                i+=5;
+                }}}           
+                
+}
+    if((LineCounter == 2) && (LineCounter <= 4) && ((_time-Start)>1000)){       //ak sa naslo 3 alebo 4 ciary a preslo od startu motorov 1s tak stopni motory a servo vyrovnaj na stred
+        //wait(0.15);
+        TFC_SetMotorPWM(0,0);
+        TFC_SetServo(0,-0.04f);
+        wait(5);}*/
+        
+
+/*for(int i=10; i < 110; i++){     
+    if((LineScan[i] >= 105) && ((LineScan[i] <= ((LineScan[i+1]) + PlusBlack))) && ((LineScan[i] >= ((LineScan[i+1]) - MinusBlack)))){        //testujeme ci je pixel cierny a ci je pixel vedla neho tiez
+        MiniLineCounter++;
+        i+=1;
+        }                          //zaznamenava dlzku jednej ciary pokial nenajdie bielu
+    else
+        MiniLineCounter=0;                       
+    if(MiniLineCounter == MinimalLineLen)           //ak je ciara priblizne velka tej spravnej tak ju pripocitaj ako pocet ciar
+        LineCounter++;
+    if(MiniLineCounter >= 35)                 //ak je ciara moc dlha tak to znamena ze to neni nasa ciara a teda ju vymazeme pretoze sa urcite pripocitala
+        LineCounter--;
+                          }
+   if((LineCounter == 2)  && ((_time-Start)>1000)){       //ak sa naslo 3 alebo 4 ciary a preslo od startu motorov 1s tak stopni motory a servo vyrovnaj na stred
+        wait(0.15);
+        TFC_SetMotorPWM(0,0);
+        TFC_SetServo(0,-0.04f);
+        wait(5);
+            }  
+               
+//koniec pocitadla ciar      
+skok: */
+ 
+
+         //  TERMINAL_PRINTF("M");
+          //  RenderLines();
+         //   TERMINAL_PRINTF("O %d : %d : %.4f : %.4f - %.4f\r\n",P , D, Pot0, Pot1, VServoPos);  // nevim ci to nieco robi ale mam to tu*/
+            
+            ServoPosOriginal=VServoPos;             //nemuselo by sa to davat do druhej premennej ale co uz     
+            TFC_SetServo( 0,VServoPos  );           //tu sa nastavi servo
+        } 
+
+        if(MaxSpeed>0) MaxSpeed=-MaxSpeed;  //motor je nejak pokašlaný a negatívne hodnoty znamenajú chod dopredu
+        if(ServoPosOriginal<-0.22f || ServoPosOriginal>0.22f) MaxSpeed = MaxSpeed + Slowness;         //v zakrutach spomali
+        
+        
+        TFC_SetMotorPWM(MaxSpeed, MaxSpeed);            //tu sa nastavi motor - but maxspeed alebo v zakrutach mensia rychlost a bacha na velke spomalenie lebo zastavi ten kar
+        
+    }
+}
